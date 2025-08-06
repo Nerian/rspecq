@@ -18,6 +18,8 @@ module RSpecQ
   class Worker
     HEARTBEAT_FREQUENCY = WORKER_LIVENESS_SEC / 6
 
+    class Restart < StandardError; end
+
     # The root path or individual spec files to execute.
     #
     # Defaults to "spec" (similar to RSpec)
@@ -33,6 +35,11 @@ module RSpecQ
     #
     # Defaults to 999999
     attr_accessor :file_split_threshold
+
+    # If set, all spec files are split and scheduled on a per-example basis.
+    #
+    # Defaults to false
+    attr_accessor :split_files
 
     # Retry failed examples up to N times (with N being the supplied value)
     # before considering them legit failures
@@ -73,7 +80,7 @@ module RSpecQ
       @file_split_threshold = 999_999
       @heartbeat_updated_at = nil
       @max_requeues = 3
-      @queue_wait_timeout = 30
+      @queue_wait_timeout = 3000
       @seed = srand && (srand % 0xFFFF)
       @tags = []
       @reproduction = false
@@ -90,6 +97,8 @@ module RSpecQ
       try_publish_queue!(queue)
       queue.wait_until_published(queue_wait_timeout)
       queue.save_worker_seed(@worker_id, seed)
+
+      i = 0
 
       loop do
         # we have to bootstrap this so that it can be used in the first call
@@ -133,6 +142,13 @@ module RSpecQ
         _result = RSpec::Core::Runner.new(opts).run($stderr, $stdout)
 
         queue.acknowledge_job(job)
+
+        if i > 200
+          raise Restart
+          i = 0
+        else
+          i += 1
+        end
       end
     end
 
@@ -157,6 +173,12 @@ module RSpecQ
       end
       RSpec.configuration.files_or_directories_to_run = files_or_dirs_to_run
       files_to_run = RSpec.configuration.files_to_run.map { |j| relative_path(j) }
+
+      if split_files
+        jobs = files_to_example_ids(files_to_run)
+        puts "Published queue (size=#{queue.publish(jobs, fail_fast)})"
+        return
+      end
 
       timings = queue.timings
       if timings.empty?
@@ -206,6 +228,7 @@ module RSpecQ
 
     def reset_rspec_state!
       RSpec.clear_examples
+      RSpec::ExampleGroups.remove_all_constants
 
       # see https://github.com/rspec/rspec-core/pull/2723
       if Gem::Version.new(RSpec::Core::Version::STRING) <= Gem::Version.new("3.9.1")
@@ -230,7 +253,12 @@ module RSpecQ
     # falling back to scheduling them as whole files. Their errors will be
     # reported in the normal flow when they're eventually picked up by a worker.
     def files_to_example_ids(files)
-      cmd = "DISABLE_SPRING=1 bundle exec rspec --dry-run --format json #{files.join(' ')}"
+      if ENV['CI']
+        cmd = "DISABLE_SPRING=1 COVERAGE=0 bundle exec rspec --dry-run --format json"
+      else
+        cmd = "DISABLE_SPRING=1 bundle exec rspec --dry-run --format json #{files.join(' ')}"
+      end
+
       out, err, cmd_result = Open3.capture3(cmd)
 
       if !cmd_result.success?
